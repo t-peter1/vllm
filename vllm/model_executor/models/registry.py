@@ -88,6 +88,8 @@ _TEXT_GENERATION_MODELS = {
     "CohereForCausalLM": ("commandr", "CohereForCausalLM"),
     "Cohere2ForCausalLM": ("commandr", "CohereForCausalLM"),
     "CwmForCausalLM": ("llama", "LlamaForCausalLM"),
+    "DCLMForCausalLM": ("dclm", "DCLMForCausalLM"),
+    "OpenLMModel": ("dclm", "DCLMForCausalLM"),
     "DbrxForCausalLM": ("dbrx", "DbrxForCausalLM"),
     "DeciLMForCausalLM": ("nemotron_nas", "DeciLMForCausalLM"),
     "DeepseekForCausalLM": ("deepseek_v2", "DeepseekForCausalLM"),
