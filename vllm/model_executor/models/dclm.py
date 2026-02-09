@@ -31,6 +31,7 @@ from itertools import islice
 
 import torch
 from torch import nn
+from torch.nn import LayerNorm
 from transformers import LlamaConfig
 
 from vllm.compilation.decorators import support_torch_compile
@@ -41,7 +42,6 @@ from vllm.model_executor.layers.attention import (
     Attention,
     EncoderOnlyAttention,
 )
-from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -307,10 +307,8 @@ class DCLMDecoderLayer(nn.Module):
             bias=getattr(config, "mlp_bias", False),
             prefix=f"{prefix}.mlp",
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+        self.input_layernorm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
@@ -323,11 +321,14 @@ class DCLMDecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            residual = residual + hidden_states
+            hidden_states = self.input_layernorm(residual)
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        residual = residual + hidden_states
+        hidden_states = self.post_attention_layernorm(residual)
+            
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -396,7 +397,7 @@ class DCLMModel(nn.Module):
             prefix=f"{prefix}.layers",
         )
         if get_pp_group().is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
 
@@ -443,7 +444,8 @@ class DCLMModel(nn.Module):
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        residual = residual + hidden_states
+        hidden_states = self.norm(residual)
 
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
