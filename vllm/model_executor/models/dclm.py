@@ -169,6 +169,8 @@ class DCLMAttention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
+        self.q_norm = LayerNorm(self.head_dim * self.total_num_heads, eps=config.rms_norm_eps)
+        self.k_norm = LayerNorm(self.head_dim * self.total_num_kv_heads, eps=config.rms_norm_eps)
 
         self.o_proj = RowParallelLinear(
             input_size=self.total_num_heads * self.head_dim,
@@ -226,6 +228,8 @@ class DCLMAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
         q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
@@ -453,12 +457,11 @@ class DCLMModel(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
-            # vLLM param name       # DCLM/OpenLM checkpoint name    # Shard ID
-            ("qkv_proj",           "attention.wqkv",                 "qkv"),
-            ("o_proj",             "attention.wo",                   None),
-            ("gate_up_proj",       "feed_forward.w1",                0), # Gate
-            ("gate_up_proj",       "feed_forward.w3",                1), # Up
-            ("down_proj",          "feed_forward.w2",                None),
+            # vLLM Name           # Safetensor Name                  # Action
+            ("qkv_proj",          "attention.in_proj",               "load_direct"),
+            ("gate_up_proj",      "feed_forward.w12",                "load_direct"), 
+            ("down_proj",         "feed_forward.w3",                 "load_direct"),
+            ("o_proj",            "attention.out_proj",              "load_direct"),
         ]
         
         params_dict = dict(self.named_parameters())
@@ -467,19 +470,23 @@ class DCLMModel(nn.Module):
         for name, loaded_weight in weights:
             if name.startswith("model."):
                 name = name[len("model."):]
-            # Mappings
+            
             name = name.replace("attention_norm", "input_layernorm")
             name = name.replace("ffn_norm", "post_attention_layernorm")
             name = name.replace("tok_embeddings", "embed_tokens")
             name = name.replace("output", "lm_head") 
             
-            if "rotary_emb.inv_freq" in name:
+            # Safetensor: layers.0.attention.q_norm -> vLLM: layers.0.self_attn.q_norm
+            name = name.replace("attention.q_norm", "self_attn.q_norm")
+            name = name.replace("attention.k_norm", "self_attn.k_norm")
+
+            if "pos_embed.inv_freq" in name:
                 continue
             
+            # Handle Quantization Scales
             if self.quant_config is not None and (
                 scale_name := self.quant_config.get_cache_scale(name)
             ):
-                # Loading kv cache quantization scales
                 param = params_dict[scale_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 loaded_weight = (
@@ -489,10 +496,12 @@ class DCLMModel(nn.Module):
                 loaded_params.add(scale_name)
                 continue
 
-            for param_name, weight_name, shard_id in stacked_params_mapping:
+            # Mappings
+            for param_name, weight_name, action in stacked_params_mapping:
                 if weight_name not in name:
                     continue
                 
+                # Construct internal vLLM name (e.g. layers.0.mlp.gate_up_proj)
                 name = name.replace(weight_name, param_name)
                 name = name.replace("feed_forward", "mlp")
                 name = name.replace("attention", "self_attn")
@@ -501,10 +510,12 @@ class DCLMModel(nn.Module):
                     continue
 
                 param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+
+                weight_loader(param, loaded_weight)
                 break
             else:
+                # Fallback for Norms and other layers not in the mapping list
                 name = name.replace("feed_forward", "mlp")
                 name = name.replace("attention", "self_attn")
                 
